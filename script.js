@@ -45,6 +45,12 @@
   let credibilitySeq = 0;
   let lastCredibilityKey = "";
   let lastCredibilityResult = null;
+  let lastAutoSourceQuery = "";
+  let suppressUrlInputFetch = false;
+  let forceShowAll = false;
+  let debounceTimer = null;
+  let fetchSeq = 0;
+  let lastFetchedUrl = "";
 
   const FIELD_META = {
     author: { label: "Author", input: () => els.author, required: true },
@@ -56,8 +62,6 @@
 
   const FIELD_ORDER = ["title", "author", "year", "site", "accessed"];
 
-  let forceShowAll = false;
-
   const FORMAT_NAMES = {
     harvard: "Harvard",
     "harvard-au": "Harvard (Australia)",
@@ -68,10 +72,6 @@
     vancouver: "Vancouver",
     bibtex: "BibTeX",
   };
-
-  let debounceTimer = null;
-  let fetchSeq = 0;
-  let lastFetchedUrl = "";
 
   function todayISO() {
     const d = new Date();
@@ -228,6 +228,15 @@
     return blocks[0] || null;
   }
 
+  function namedEntity(value) {
+    if (!value) return "";
+    if (typeof value === "string") return cleanText(value);
+    if (typeof value === "object") {
+      return cleanText(value.name || value.legalName || value.alternateName || "");
+    }
+    return "";
+  }
+
   function extractFromHtml(html, url) {
     const ld = pickJsonLd(extractJsonLd(html));
     const title =
@@ -271,7 +280,8 @@
       yearFromAny(url.match(/\/((?:19|20)\d{2})(?:\/|$)/)?.[1]);
 
     const site =
-      cleanText(ld && (ld.isPartOf?.name || ld.publisher?.name || ld.publisher)) ||
+      namedEntity(ld?.isPartOf) ||
+      namedEntity(ld?.publisher) ||
       metaContent(html, ["og:site_name", "application-name", "citation_journal_title", "publisher"]) ||
       siteNameFromHost(hostnameOf(url));
 
@@ -282,6 +292,28 @@
     const res = await fetch(url, { signal: AbortSignal.timeout(timeout) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
+  }
+
+  async function fetchJsonWithRetry(url, timeout = 12000, retries = 2) {
+    let lastError = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(timeout) });
+        if (res.status === 429 || res.status === 503) {
+          lastError = new Error(`HTTP ${res.status}`);
+          await new Promise((resolve) => setTimeout(resolve, 700 * (attempt + 1)));
+          continue;
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      } catch (err) {
+        lastError = err;
+        if (attempt < retries) {
+          await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+        }
+      }
+    }
+    throw lastError || new Error("Request failed");
   }
 
   async function fetchText(url, timeout = 12000) {
@@ -515,7 +547,7 @@
     };
   }
 
-  function convertCitation() {
+  async function convertCitation() {
     const parsed = parseCitationText(els.citationInput.value);
     if (!parsed) {
       setStatus("Paste a citation first — include author, year, title, or a DOI/URL if you have one.", "error");
@@ -532,14 +564,14 @@
     els.accessed.value = todayISO();
     lastFetchedUrl = parsed.url || "";
     updateFieldVisibility();
-    generate();
 
     const missing = FIELD_ORDER.filter((k) => k !== "accessed" && !isFieldFilled(k)).length;
     if (missing > 0) {
-      setStatus(`Converted. Fill in ${missing} missing field${missing === 1 ? "" : "s"}, then pick a style.`, "ok");
-    } else {
-      setStatus("Citation converted. Choose a style above, or find stronger sources below.", "ok");
+      setStatus(`Converted. Fill in ${missing} missing field${missing === 1 ? "" : "s"}, then check credibility & cite.`, "ok");
+      return;
     }
+
+    await generate();
   }
 
   function setSourcesStatus(message, kind = "") {
@@ -778,7 +810,7 @@
     }
   }
 
-  function citeSourceAt(index) {
+  async function citeSourceAt(index) {
     const sources = els.sourcesList._sources || [];
     const src = sources[index];
     if (!src) return;
@@ -793,9 +825,9 @@
     lastFetchedUrl = src.url || "";
     lastCredibilityKey = "";
     lastCredibilityResult = null;
+    lastAutoSourceQuery = "";
     updateFieldVisibility();
-    generate({ skipCredibilityCache: true });
-    setStatus("Loaded a suggested source. Credibility will be re-checked.", "ok");
+    await generate({ skipCredibilityCache: true });
     els.citationBlock.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 
@@ -844,7 +876,7 @@
     const api =
       `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(query)}` +
       `&limit=1&fields=title,authors,year,url,venue,citationCount,externalIds,abstract`;
-    const data = await fetchJson(api, 12000);
+    const data = await fetchJsonWithRetry(api, 12000, 2);
     const paper = data?.data?.[0];
     if (!paper) {
       return {
@@ -1036,7 +1068,7 @@
         citeBtn.type = "button";
         citeBtn.className = "btn-mini";
         citeBtn.textContent = "Cite this instead";
-        citeBtn.addEventListener("click", () => {
+        citeBtn.addEventListener("click", async () => {
           forceShowAll = false;
           els.url.value = item.url || "";
           els.author.value = item.author || "";
@@ -1047,9 +1079,9 @@
           lastFetchedUrl = item.url || "";
           lastCredibilityKey = "";
           lastCredibilityResult = null;
+          lastAutoSourceQuery = "";
           updateFieldVisibility();
-          generate({ skipCredibilityCache: true });
-          setStatus(`Switched to the ${item.outlet} source. Re-checking credibility.`, "ok");
+          await generate({ skipCredibilityCache: true });
         });
         actions.appendChild(citeBtn);
       }
@@ -1232,7 +1264,9 @@
 
     if (url === lastFetchedUrl && (els.title.value || els.site.value)) {
       updateFieldVisibility();
-      generate();
+      if (cleanText(els.title.value) || cleanText(els.author.value)) {
+        await generate();
+      }
       return;
     }
 
@@ -1249,12 +1283,18 @@
       lastFetchedUrl = url;
 
       const missingCount = FIELD_ORDER.filter((k) => k !== "accessed" && !isFieldFilled(k)).length;
-      if (missingCount > 0) {
-        setStatus(`Link read. Fill in the ${missingCount} missing field${missingCount === 1 ? "" : "s"} below.`, "ok");
-      } else {
-        setStatus("All details found from your link. Citation is ready below.", "ok");
+      const canCite = Boolean(cleanText(els.title.value) || cleanText(els.author.value));
+
+      if (!canCite) {
+        setStatus("Link read, but title/author are missing — fill those in, then check credibility & cite.", "error");
+        return;
       }
-      generate();
+
+      if (missingCount > 0) {
+        setStatus(`Link read. Fill in the ${missingCount} missing field${missingCount === 1 ? "" : "s"} below, or cite with what we have.`, "ok");
+      }
+
+      await generate();
     } catch {
       if (seq !== fetchSeq) return;
       els.site.value = siteNameFromHost(hostnameOf(url));
@@ -1478,14 +1518,12 @@
 
   function renderCitationOnly() {
     const src = getSource();
-    if (!src.title && !src.author) return;
+    if (!cleanText(els.title.value) && !cleanText(els.author.value)) return;
     if (activeMode === "link" && !src.url) return;
     const style = els.format.value;
     els.citationLabel.textContent = FORMAT_NAMES[style] || "Citation";
     els.citationOutput.textContent = formatters[style](src);
   }
-
-  let lastAutoSourceQuery = "";
 
   async function generate(options = {}) {
     const src = getSource();
@@ -1494,7 +1532,8 @@
       els.url.focus();
       return;
     }
-    if (!src.title && !src.author) {
+    // getSource() defaults empty title to "Untitled" — check raw fields
+    if (!cleanText(els.title.value) && !cleanText(els.author.value)) {
       setStatus("Add a title or author before generating.", "error");
       return;
     }
@@ -1638,6 +1677,7 @@
   });
 
   els.url.addEventListener("paste", () => {
+    suppressUrlInputFetch = true;
     clearTimeout(debounceTimer);
     setTimeout(() => {
       if (looksLikeUrl(els.url.value)) {
@@ -1646,6 +1686,10 @@
         lastFetchedUrl = "";
         fetchDetails({ silentInvalid: true });
       }
+      // Allow input handler again after paste-driven fetch has started
+      setTimeout(() => {
+        suppressUrlInputFetch = false;
+      }, 800);
     }, 0);
   });
 
@@ -1653,6 +1697,7 @@
     lastFetchedUrl = "";
     hideDetails();
     setStatus("");
+    if (suppressUrlInputFetch) return;
     scheduleAutoFetch();
   });
 
